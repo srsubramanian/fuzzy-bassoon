@@ -1,7 +1,7 @@
 [project]
 name = "fuzzy-bassoon"
 version = "0.1.0"
-description = "A Hello World MCP Server with expandable features"
+description = "A strict read-only PostgreSQL MCP Server with security controls and audit logging"
 readme = "README.md"
 authors = [
     { name = "srsubramanian", email = "subramanian_psg@yahoo.com" }
@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.13"
 dependencies = [
     "mcp>=1.20.0",
+    "asyncpg>=0.29.0",
 ]
 
 [project.scripts]
