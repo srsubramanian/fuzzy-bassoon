@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This is a **PostgreSQL MCP (Model Context Protocol) server** with strict read-only access controls, built with Python 3.13+ and managed with uv. The server provides secure database access through the MCP protocol with comprehensive security features including query validation, audit logging, row limits, and timeout protection.
+This is a **PostgreSQL MCP (Model Context Protocol) server** with strict read-only access controls, built with **FastMCP**, Python 3.13+, and managed with uv. The server provides secure database access through the MCP protocol with comprehensive security features including query validation, audit logging, row limits, and timeout protection.
+
+**Key Technologies:**
+- **FastMCP** - Simplified MCP server framework with automatic schema generation from type hints
+- **asyncpg** - High-performance async PostgreSQL driver
+- **Pydantic** - Data validation using Python type annotations
 
 ## Project Structure
 

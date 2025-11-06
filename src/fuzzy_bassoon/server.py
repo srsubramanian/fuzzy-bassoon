@@ -1,5 +1,5 @@
 """
-PostgreSQL MCP Server - Strict Read-Only Version
+PostgreSQL MCP Server - Strict Read-Only Version (FastMCP)
 Enhanced with row limits, timeouts, table/schema restrictions, and audit logging
 """
 
@@ -8,10 +8,11 @@ import json
 import os
 import logging
 from datetime import datetime
-from typing import Any, Optional, List, Set
+from typing import Optional, Set
+from contextlib import asynccontextmanager
 import asyncpg
-from mcp.server import Server
-from mcp.types import Tool, TextContent
+from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field
 
 # Configure logging
 logging.basicConfig(
@@ -23,9 +24,6 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
-
-# Initialize MCP server
-app = Server("fuzzy-bassoon-postgres")
 
 # Database connection pool
 db_pool: Optional[asyncpg.Pool] = None
@@ -209,306 +207,259 @@ async def get_db_pool() -> asyncpg.Pool:
 
 
 # ============================================================================
-# MCP TOOLS
+# LIFESPAN MANAGEMENT
 # ============================================================================
 
-@app.list_tools()
-async def list_tools() -> list[Tool]:
-    """List available database tools (STRICT READ-ONLY ACCESS)"""
-    return [
-        Tool(
-            name="query_database",
-            description=f"Execute a read-only SELECT query. Max {SecurityConfig.MAX_ROWS_LIMIT} rows, {SecurityConfig.QUERY_TIMEOUT_SECONDS}s timeout. Only SELECT queries allowed.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "SQL SELECT query to execute (read-only)"
-                    },
-                    "params": {
-                        "type": "array",
-                        "description": "Query parameters for $1, $2, etc. placeholders",
-                        "items": {"type": ["string", "number", "boolean", "null"]}
-                    }
-                },
-                "required": ["query"]
-            }
-        ),
-        Tool(
-            name="get_table_schema",
-            description="Get detailed schema information for allowed tables",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "table_name": {
-                        "type": "string",
-                        "description": "Name of the table"
-                    },
-                    "schema_name": {
-                        "type": "string",
-                        "description": "Schema name (default: 'public')",
-                        "default": "public"
-                    }
-                },
-                "required": ["table_name"]
-            }
-        ),
-        Tool(
-            name="list_tables",
-            description="List accessible tables (respects schema restrictions)",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "schema_name": {
-                        "type": "string",
-                        "description": "Filter by schema name (optional)"
-                    }
-                }
-            }
-        ),
-        Tool(
-            name="get_security_config",
-            description="View current security restrictions and limits",
-            inputSchema={
-                "type": "object",
-                "properties": {}
-            }
-        )
-    ]
-
-
-@app.call_tool()
-async def call_tool(name: str, arguments: Any) -> list[TextContent]:
-    """Handle tool calls (STRICT READ-ONLY)"""
+@asynccontextmanager
+async def lifespan(server: FastMCP):
+    """Lifespan context manager for connection pool"""
+    # Startup: Initialize connection pool
+    await get_db_pool()
+    logger.info("FastMCP server initialized with database connection pool")
     
-    try:
-        pool = await get_db_pool()
-        
-        if name == "query_database":
-            import time
-            start_time = time.time()
-            
-            query = arguments.get("query")
-            params = arguments.get("params", [])
-            
-            # VALIDATION 1: Read-only query check
-            is_valid, message = validate_read_only_query(query)
-            if not is_valid:
-                audit_log("QUERY_BLOCKED", query=query, success=False, error=message)
-                return [TextContent(
-                    type="text",
-                    text=f"❌ Query validation failed: {message}\n\n🔒 This server enforces strict read-only access."
-                )]
-            
-            # VALIDATION 2: Table/Schema access check
-            is_valid, message = validate_table_access(query)
-            if not is_valid:
-                audit_log("ACCESS_DENIED", query=query, success=False, error=message)
-                return [TextContent(
-                    type="text",
-                    text=f"❌ Access denied: {message}"
-                )]
-            
-            # RESTRICTION: Add LIMIT clause if not present
-            upper_query = query.upper().strip()
-            if 'LIMIT' not in upper_query:
-                query = f"{query.rstrip(';')} LIMIT {SecurityConfig.MAX_ROWS_LIMIT}"
-                logger.info(f"Added LIMIT clause: {SecurityConfig.MAX_ROWS_LIMIT}")
-            
-            # Execute query with timeout
-            async with pool.acquire() as conn:
-                try:
-                    rows = await asyncio.wait_for(
-                        conn.fetch(query, *params),
-                        timeout=SecurityConfig.QUERY_TIMEOUT_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    error_msg = f"Query exceeded timeout limit of {SecurityConfig.QUERY_TIMEOUT_SECONDS}s"
-                    audit_log("QUERY_TIMEOUT", query=query, success=False, error=error_msg)
-                    return [TextContent(
-                        type="text",
-                        text=f"❌ {error_msg}"
-                    )]
-                
-                results = [dict(row) for row in rows]
-                row_count = len(results)
-                execution_time = time.time() - start_time
-                
-                # Audit log successful query
-                audit_log(
-                    "QUERY_SUCCESS", 
-                    query=query, 
-                    success=True, 
-                    rows_returned=row_count,
-                    execution_time=execution_time
-                )
-                
-                response = {
-                    "rowCount": row_count,
-                    "executionTimeMs": round(execution_time * 1000, 2),
-                    "data": results,
-                    "restrictions": {
-                        "maxRowsLimit": SecurityConfig.MAX_ROWS_LIMIT,
-                        "timeoutSeconds": SecurityConfig.QUERY_TIMEOUT_SECONDS
-                    }
-                }
-                
-                return [TextContent(
-                    type="text",
-                    text=json.dumps(response, indent=2, default=str)
-                )]
-        
-        elif name == "get_table_schema":
-            table_name = arguments.get("table_name")
-            schema_name = arguments.get("schema_name", "public")
-            
-            # Check schema access
-            if schema_name in SecurityConfig.BLOCKED_SCHEMAS:
-                audit_log("ACCESS_DENIED", success=False, error=f"Schema {schema_name} is blocked")
-                return [TextContent(
-                    type="text",
-                    text=f"❌ Access to schema '{schema_name}' is not allowed"
-                )]
-            
-            # Check table access
-            full_table = f"{schema_name}.{table_name}"
-            if SecurityConfig.ALLOWED_TABLES:
-                if full_table not in SecurityConfig.ALLOWED_TABLES and table_name not in SecurityConfig.ALLOWED_TABLES:
-                    audit_log("ACCESS_DENIED", success=False, error=f"Table {full_table} not in whitelist")
-                    return [TextContent(
-                        type="text",
-                        text=f"❌ Access to table '{full_table}' is not allowed"
-                    )]
-            
-            schema_query = """
-                SELECT 
-                    column_name,
-                    data_type,
-                    character_maximum_length,
-                    is_nullable,
-                    column_default
-                FROM information_schema.columns
-                WHERE table_schema = $1 AND table_name = $2
-                ORDER BY ordinal_position
-            """
-            
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(schema_query, schema_name, table_name)
-                schema_info = [dict(row) for row in rows]
-                
-                audit_log("SCHEMA_QUERY", success=True)
-                
-                return [TextContent(
-                    type="text",
-                    text=json.dumps(schema_info, indent=2, default=str)
-                )]
-        
-        elif name == "list_tables":
-            schema_name = arguments.get("schema_name")
-            
-            # Build query based on restrictions
-            if schema_name:
-                if schema_name in SecurityConfig.BLOCKED_SCHEMAS:
-                    return [TextContent(
-                        type="text",
-                        text=f"❌ Access to schema '{schema_name}' is not allowed"
-                    )]
-                
-                tables_query = """
-                    SELECT schemaname as schema_name, tablename as table_name
-                    FROM pg_tables
-                    WHERE schemaname = $1
-                    ORDER BY tablename
-                """
-                params = [schema_name]
-            else:
-                # Exclude blocked schemas
-                blocked_list = ",".join([f"'{s}'" for s in SecurityConfig.BLOCKED_SCHEMAS])
-                tables_query = f"""
-                    SELECT schemaname as schema_name, tablename as table_name
-                    FROM pg_tables
-                    WHERE schemaname NOT IN ({blocked_list})
-                    ORDER BY schemaname, tablename
-                """
-                params = []
-            
-            async with pool.acquire() as conn:
-                rows = await conn.fetch(tables_query, *params)
-                all_tables = [dict(row) for row in rows]
-                
-                # Filter by allowed tables if whitelist is configured
-                if SecurityConfig.ALLOWED_TABLES:
-                    filtered_tables = []
-                    for table in all_tables:
-                        full_name = f"{table['schema_name']}.{table['table_name']}"
-                        if full_name in SecurityConfig.ALLOWED_TABLES or table['table_name'] in SecurityConfig.ALLOWED_TABLES:
-                            filtered_tables.append(table)
-                    all_tables = filtered_tables
-                
-                audit_log("LIST_TABLES", success=True, rows_returned=len(all_tables))
-                
-                return [TextContent(
-                    type="text",
-                    text=json.dumps(all_tables, indent=2, default=str)
-                )]
-        
-        elif name == "get_security_config":
-            config = {
-                "restrictions": {
-                    "maxRowsLimit": SecurityConfig.MAX_ROWS_LIMIT,
-                    "queryTimeoutSeconds": SecurityConfig.QUERY_TIMEOUT_SECONDS,
-                    "allowedTables": list(SecurityConfig.ALLOWED_TABLES) if SecurityConfig.ALLOWED_TABLES else "ALL (no restrictions)",
-                    "blockedSchemas": list(SecurityConfig.BLOCKED_SCHEMAS),
-                    "auditLogging": SecurityConfig.ENABLE_AUDIT_LOG
-                },
-                "allowedOperations": ["SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "WITH"],
-                "blockedOperations": ["INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER", "CREATE", "GRANT", "REVOKE"]
-            }
-            
-            return [TextContent(
-                type="text",
-                text=json.dumps(config, indent=2)
-            )]
-        
-        else:
-            return [TextContent(
-                type="text",
-                text=f"Unknown tool: {name}"
-            )]
-            
-    except Exception as e:
-        error_msg = str(e)
-        audit_log("ERROR", success=False, error=error_msg)
-        return [TextContent(
-            type="text",
-            text=f"Error executing {name}: {error_msg}"
-        )]
-
-
-async def cleanup():
-    """Cleanup database connections"""
+    yield
+    
+    # Shutdown: Close connection pool
     global db_pool
     if db_pool:
         await db_pool.close()
         logger.info("Database connection pool closed")
 
 
-async def main():
-    """Run the MCP server"""
-    from mcp.server.stdio import stdio_server
-    
-    logger.info("Starting PostgreSQL MCP Server (Strict Read-Only)")
+# ============================================================================
+# PYDANTIC MODELS FOR STRUCTURED OUTPUT
+# ============================================================================
+
+class QueryResult(BaseModel):
+    """Structured query result"""
+    rowCount: int = Field(description="Number of rows returned")
+    executionTimeMs: float = Field(description="Query execution time in milliseconds")
+    data: list[dict] = Field(description="Query results")
+    restrictions: dict = Field(description="Applied security restrictions")
+
+
+class TableSchema(BaseModel):
+    """Table schema information"""
+    column_name: str
+    data_type: str
+    character_maximum_length: Optional[int] = None
+    is_nullable: str
+    column_default: Optional[str] = None
+
+
+class TableInfo(BaseModel):
+    """Table information"""
+    schema_name: str
+    table_name: str
+
+
+# ============================================================================
+# FASTMCP SERVER & TOOLS
+# ============================================================================
+
+# Initialize FastMCP server with lifespan
+mcp = FastMCP("fuzzy-bassoon-postgres", lifespan=lifespan)
+
+
+@mcp.tool()
+async def query_database(
+    query: str = Field(description="SQL SELECT query to execute (read-only)"),
+    params: list = Field(default=[], description="Query parameters for $1, $2, etc. placeholders")
+) -> str:
+    """
+    Execute a read-only SELECT query with strict security validation.
+    Max rows: {MAX_ROWS_LIMIT}, Timeout: {QUERY_TIMEOUT_SECONDS}s.
+    Only SELECT, SHOW, EXPLAIN, DESCRIBE, and WITH queries allowed.
+    """
+    import time
+    start_time = time.time()
     
     try:
-        async with stdio_server() as (read_stream, write_stream):
-            await app.run(
-                read_stream,
-                write_stream,
-                app.create_initialization_options()
+        pool = await get_db_pool()
+        # VALIDATION 1: Read-only query check
+        is_valid, message = validate_read_only_query(query)
+        if not is_valid:
+            audit_log("QUERY_BLOCKED", query=query, success=False, error=message)
+            return f"❌ Query validation failed: {message}\n\n🔒 This server enforces strict read-only access."
+        
+        # VALIDATION 2: Table/Schema access check
+        is_valid, message = validate_table_access(query)
+        if not is_valid:
+            audit_log("ACCESS_DENIED", query=query, success=False, error=message)
+            return f"❌ Access denied: {message}"
+        
+        # RESTRICTION: Add LIMIT clause if not present
+        upper_query = query.upper().strip()
+        if 'LIMIT' not in upper_query:
+            query = f"{query.rstrip(';')} LIMIT {SecurityConfig.MAX_ROWS_LIMIT}"
+            logger.info(f"Added LIMIT clause: {SecurityConfig.MAX_ROWS_LIMIT}")
+        
+        # Execute query with timeout
+        async with pool.acquire() as conn:
+            try:
+                rows = await asyncio.wait_for(
+                    conn.fetch(query, *params),
+                    timeout=SecurityConfig.QUERY_TIMEOUT_SECONDS
+                )
+            except asyncio.TimeoutError:
+                error_msg = f"Query exceeded timeout limit of {SecurityConfig.QUERY_TIMEOUT_SECONDS}s"
+                audit_log("QUERY_TIMEOUT", query=query, success=False, error=error_msg)
+                return f"❌ {error_msg}"
+            
+            results = [dict(row) for row in rows]
+            row_count = len(results)
+            execution_time = time.time() - start_time
+            
+            # Audit log successful query
+            audit_log(
+                "QUERY_SUCCESS", 
+                query=query, 
+                success=True, 
+                rows_returned=row_count,
+                execution_time=execution_time
             )
-    finally:
-        await cleanup()
+            
+            response = {
+                "rowCount": row_count,
+                "executionTimeMs": round(execution_time * 1000, 2),
+                "data": results,
+                "restrictions": {
+                    "maxRowsLimit": SecurityConfig.MAX_ROWS_LIMIT,
+                    "timeoutSeconds": SecurityConfig.QUERY_TIMEOUT_SECONDS
+                }
+            }
+            
+            return json.dumps(response, indent=2, default=str)
+    
+    except Exception as e:
+        error_msg = str(e)
+        audit_log("ERROR", success=False, error=error_msg)
+        return f"Error executing query: {error_msg}"
+
+
+@mcp.tool()
+async def get_table_schema(
+    table_name: str = Field(description="Name of the table"),
+    schema_name: str = Field(default="public", description="Schema name (default: 'public')")
+) -> str:
+    """Get detailed schema information for allowed tables including columns, data types, and constraints."""
+    try:
+        pool = await get_db_pool()
+        
+        # Check schema access
+        if schema_name in SecurityConfig.BLOCKED_SCHEMAS:
+            audit_log("ACCESS_DENIED", success=False, error=f"Schema {schema_name} is blocked")
+            return f"❌ Access to schema '{schema_name}' is not allowed"
+        
+        # Check table access
+        full_table = f"{schema_name}.{table_name}"
+        if SecurityConfig.ALLOWED_TABLES:
+            if full_table not in SecurityConfig.ALLOWED_TABLES and table_name not in SecurityConfig.ALLOWED_TABLES:
+                audit_log("ACCESS_DENIED", success=False, error=f"Table {full_table} not in whitelist")
+                return f"❌ Access to table '{full_table}' is not allowed"
+        
+        schema_query = """
+            SELECT 
+                column_name,
+                data_type,
+                character_maximum_length,
+                is_nullable,
+                column_default
+            FROM information_schema.columns
+            WHERE table_schema = $1 AND table_name = $2
+            ORDER BY ordinal_position
+        """
+        
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(schema_query, schema_name, table_name)
+            schema_info = [dict(row) for row in rows]
+            
+            audit_log("SCHEMA_QUERY", success=True)
+            
+            return json.dumps(schema_info, indent=2, default=str)
+    
+    except Exception as e:
+        error_msg = str(e)
+        audit_log("ERROR", success=False, error=error_msg)
+        return f"Error getting table schema: {error_msg}"
+
+
+@mcp.tool()
+async def list_tables(
+    schema_name: Optional[str] = Field(default=None, description="Filter by schema name (optional)")
+) -> str:
+    """List all accessible tables in the database, respecting schema restrictions and table whitelists."""
+    try:
+        pool = await get_db_pool()
+        
+        # Build query based on restrictions
+        if schema_name:
+            if schema_name in SecurityConfig.BLOCKED_SCHEMAS:
+                return f"❌ Access to schema '{schema_name}' is not allowed"
+            
+            tables_query = """
+                SELECT schemaname as schema_name, tablename as table_name
+                FROM pg_tables
+                WHERE schemaname = $1
+                ORDER BY tablename
+            """
+            params = [schema_name]
+        else:
+            # Exclude blocked schemas
+            blocked_list = ",".join([f"'{s}'" for s in SecurityConfig.BLOCKED_SCHEMAS])
+            tables_query = f"""
+                SELECT schemaname as schema_name, tablename as table_name
+                FROM pg_tables
+                WHERE schemaname NOT IN ({blocked_list})
+                ORDER BY schemaname, tablename
+            """
+            params = []
+        
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(tables_query, *params)
+            all_tables = [dict(row) for row in rows]
+            
+            # Filter by allowed tables if whitelist is configured
+            if SecurityConfig.ALLOWED_TABLES:
+                filtered_tables = []
+                for table in all_tables:
+                    full_name = f"{table['schema_name']}.{table['table_name']}"
+                    if full_name in SecurityConfig.ALLOWED_TABLES or table['table_name'] in SecurityConfig.ALLOWED_TABLES:
+                        filtered_tables.append(table)
+                all_tables = filtered_tables
+            
+            audit_log("LIST_TABLES", success=True, rows_returned=len(all_tables))
+            
+            return json.dumps(all_tables, indent=2, default=str)
+    
+    except Exception as e:
+        error_msg = str(e)
+        audit_log("ERROR", success=False, error=error_msg)
+        return f"Error listing tables: {error_msg}"
+
+
+@mcp.tool()
+async def get_security_config() -> str:
+    """View current security restrictions, limits, allowed operations, and blocked operations."""
+    config = {
+        "restrictions": {
+            "maxRowsLimit": SecurityConfig.MAX_ROWS_LIMIT,
+            "queryTimeoutSeconds": SecurityConfig.QUERY_TIMEOUT_SECONDS,
+            "allowedTables": list(SecurityConfig.ALLOWED_TABLES) if SecurityConfig.ALLOWED_TABLES else "ALL (no restrictions)",
+            "blockedSchemas": list(SecurityConfig.BLOCKED_SCHEMAS),
+            "auditLogging": SecurityConfig.ENABLE_AUDIT_LOG
+        },
+        "allowedOperations": ["SELECT", "SHOW", "EXPLAIN", "DESCRIBE", "WITH"],
+        "blockedOperations": ["INSERT", "UPDATE", "DELETE", "DROP", "TRUNCATE", "ALTER", "CREATE", "GRANT", "REVOKE"]
+    }
+    
+    return json.dumps(config, indent=2)
+
+
+async def main():
+    """Run the FastMCP server"""
+    logger.info("Starting PostgreSQL MCP Server (Strict Read-Only) - FastMCP")
+    await mcp.run()
 
 
 if __name__ == "__main__":
